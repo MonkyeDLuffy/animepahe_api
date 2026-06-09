@@ -4,27 +4,39 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
+app.use(express.json());
 
-const BASE = "https://kkkkkkkkk-cmotakus-projects.vercel.app/api/";
-const PROXY = "https://animepaheproxy.vercel.app/m3u8-proxy?url=";
+const BASE =
+  process.env.BASE_API_URL ||
+  "https://kkkkkkkkk-cmotakus-projects.vercel.app/api";
+const PROXY =
+  process.env.M3U8_PROXY_URL ||
+  "https://animepaheproxy.vercel.app/m3u8-proxy?url=";
 
 const PORT = process.env.PORT || 3000;
 
-const mappingCache = {};
-const episodeCache = {};
-const searchCache = {};
-const anilistCache = {};
+const CACHE_TTL = {
+  SEARCH: 1000 * 60 * 15,
+  MAPPING: 1000 * 60 * 60 * 12,
+  EPISODES: 1000 * 60 * 30,
+  ANILIST: 1000 * 60 * 60 * 6,
+  STREAM: 1000 * 60 * 10,
+};
 
-const AXIOS_CONFIG = {
+const cacheStore = new Map();
+const inflight = new Map();
+
+const http = axios.create({
+  timeout: 30000,
   headers: {
     "User-Agent":
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     Accept: "application/json,text/plain,*/*",
     Referer: "https://animepahe.pw/",
     Origin: "https://animepahe.pw",
   },
-  timeout: 30000,
-};
+  validateStatus: () => true,
+});
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -48,20 +60,84 @@ function titleIncludes(a = "", b = "") {
   return x.includes(y) || y.includes(x);
 }
 
+function setCache(key, value, ttl) {
+  cacheStore.set(key, {
+    value,
+    expiresAt: Date.now() + ttl,
+  });
+}
+
+function getCache(key) {
+  const item = cacheStore.get(key);
+  if (!item) return null;
+  if (Date.now() > item.expiresAt) {
+    cacheStore.delete(key);
+    return null;
+  }
+  return item.value;
+}
+
+function withInflight(key, factory) {
+  if (inflight.has(key)) return inflight.get(key);
+
+  const promise = Promise.resolve()
+    .then(factory)
+    .finally(() => inflight.delete(key));
+
+  inflight.set(key, promise);
+  return promise;
+}
+
+function isHtmlResponse(response) {
+  const contentType = String(response?.headers?.["content-type"] || "").toLowerCase();
+  const text =
+    typeof response?.data === "string"
+      ? response.data.slice(0, 600).toLowerCase()
+      : "";
+
+  return (
+    contentType.includes("text/html") ||
+    text.includes("<html") ||
+    text.includes("<!doctype html") ||
+    text.includes("vercel authentication") ||
+    text.includes("deployment protection")
+  );
+}
+
+function normalizeBaseUrl(url = "") {
+  return String(url).replace(/\/+$/, "");
+}
+
 async function safeFetch(url, retries = 2) {
   let lastError;
 
   for (let i = 0; i <= retries; i++) {
     try {
-      return await axios.get(url, AXIOS_CONFIG);
+      const response = await http.get(url);
+
+      if (response.status >= 500) {
+        throw new Error(`Upstream error ${response.status}`);
+      }
+
+      if (isHtmlResponse(response)) {
+        throw new Error(
+          "Upstream returned HTML instead of JSON. The BASE API is likely protected or no longer public."
+        );
+      }
+
+      if (response.status >= 400) {
+        throw new Error(`Upstream request failed with ${response.status}`);
+      }
+
+      return response;
     } catch (err) {
       lastError = err;
       console.log(
         `Request failed attempt ${i + 1}/${retries + 1}:`,
-        err.response?.status || err.message
+        err?.response?.status || err.message
       );
 
-      if (i < retries) await sleep(2000);
+      if (i < retries) await sleep(1200 * (i + 1));
     }
   }
 
@@ -69,74 +145,81 @@ async function safeFetch(url, retries = 2) {
 }
 
 async function fetchAniListInfo(anilistId) {
-  if (anilistCache[anilistId]) return anilistCache[anilistId];
+  const key = `anilist:${anilistId}`;
+  const cached = getCache(key);
+  if (cached) return cached;
 
-  const query = `
-    query ($id: Int) {
-      Media(id: $id, type: ANIME) {
-        id
-        title {
-          romaji
-          english
-          native
+  return withInflight(key, async () => {
+    const query = `
+      query ($id: Int) {
+        Media(id: $id, type: ANIME) {
+          id
+          title {
+            romaji
+            english
+            native
+          }
+          startDate {
+            year
+          }
+          season
+          seasonYear
+          episodes
+          format
+          synonyms
         }
-        startDate {
-          year
-        }
-        season
-        seasonYear
-        episodes
-        format
-        synonyms
       }
-    }
-  `;
+    `;
 
-  const res = await axios.post(
-    "https://graphql.anilist.co",
-    {
-      query,
-      variables: { id: Number(anilistId) },
-    },
-    {
-      headers: {
-        "Content-Type": "application/json",
-        Accept: "application/json",
+    const res = await axios.post(
+      "https://graphql.anilist.co",
+      {
+        query,
+        variables: { id: Number(anilistId) },
       },
-      timeout: 30000,
-    }
-  );
+      {
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+        },
+        timeout: 30000,
+      }
+    );
 
-  const media = res.data?.data?.Media;
+    const media = res.data?.data?.Media;
 
-  if (!media) throw new Error("AniList anime not found");
+    if (!media) throw new Error("AniList anime not found");
 
-  const info = {
-    id: media.id,
-    romaji: media.title?.romaji || "",
-    english: media.title?.english || "",
-    native: media.title?.native || "",
-    year: media.seasonYear || media.startDate?.year || null,
-    episodes: media.episodes || null,
-    format: media.format || "",
-    season: media.season || "",
-    synonyms: media.synonyms || [],
-  };
+    const info = {
+      id: media.id,
+      romaji: media.title?.romaji || "",
+      english: media.title?.english || "",
+      native: media.title?.native || "",
+      year: media.seasonYear || media.startDate?.year || null,
+      episodes: media.episodes || null,
+      format: media.format || "",
+      season: media.season || "",
+      synonyms: media.synonyms || [],
+    };
 
-  anilistCache[anilistId] = info;
-  return info;
+    setCache(key, info, CACHE_TTL.ANILIST);
+    return info;
+  });
 }
 
 async function searchAnimePahe(q) {
-  const key = cleanTitle(q);
+  const key = `search:${cleanTitle(q)}`;
+  const cached = getCache(key);
+  if (cached) return cached;
 
-  if (searchCache[key]) return searchCache[key];
+  return withInflight(key, async () => {
+    const url = `${normalizeBaseUrl(BASE)}/search?q=${encodeURIComponent(q)}`;
+    const res = await safeFetch(url);
+    const results = Array.isArray(res.data?.data) ? res.data.data : [];
 
-  const res = await safeFetch(`${BASE}/search?q=${encodeURIComponent(q)}`);
-  const results = res.data?.data || [];
-
-  searchCache[key] = results;
-  return results;
+    setCache(key, results, CACHE_TTL.SEARCH);
+    return results;
+  });
 }
 
 function scoreCandidate(candidate, anilist) {
@@ -179,99 +262,110 @@ function scoreCandidate(candidate, anilist) {
 }
 
 async function resolveAnimePaheSession(anilistId) {
-  if (mappingCache[anilistId]) return mappingCache[anilistId];
+  const key = `mapping:${anilistId}`;
+  const cached = getCache(key);
+  if (cached) return cached;
 
-  const anilist = await fetchAniListInfo(anilistId);
+  return withInflight(key, async () => {
+    const anilist = await fetchAniListInfo(anilistId);
 
-  const queries = [
-    anilist.english,
-    anilist.romaji,
-    ...(anilist.synonyms || []),
-  ].filter(Boolean);
+    const queries = [
+      anilist.english,
+      anilist.romaji,
+      ...(anilist.synonyms || []),
+    ].filter(Boolean);
 
-  let allResults = [];
+    let allResults = [];
 
-  for (const q of queries) {
-    try {
-      const results = await searchAnimePahe(q);
-      allResults.push(...results);
-    } catch (err) {
-      console.log("Search failed:", q, err.message);
+    for (const q of queries) {
+      try {
+        const results = await searchAnimePahe(q);
+        allResults.push(...results);
+      } catch (err) {
+        console.log("Search failed:", q, err.message);
+      }
     }
-  }
 
-  const unique = [];
-  const seen = new Set();
+    const unique = [];
+    const seen = new Set();
 
-  for (const item of allResults) {
-    if (!item?.session) continue;
-    if (seen.has(item.session)) continue;
-    seen.add(item.session);
-    unique.push(item);
-  }
+    for (const item of allResults) {
+      if (!item?.session) continue;
+      if (seen.has(item.session)) continue;
+      seen.add(item.session);
+      unique.push(item);
+    }
 
-  if (!unique.length) throw new Error("AnimePahe result not found");
+    if (!unique.length) {
+      throw new Error(
+        "No matching results found. Upstream may be broken, protected, or returning incomplete data."
+      );
+    }
 
-  const ranked = unique
-    .map((item) => ({
-      ...item,
-      matchScore: scoreCandidate(item, anilist),
-    }))
-    .sort((a, b) => b.matchScore - a.matchScore);
+    const ranked = unique
+      .map((item) => ({
+        ...item,
+        matchScore: scoreCandidate(item, anilist),
+      }))
+      .sort((a, b) => b.matchScore - a.matchScore);
 
-  const best = ranked[0];
+    const best = ranked[0];
 
-  mappingCache[anilistId] = {
-    anilistId,
-    session: best.session,
-    title: best.title,
-    animepaheId: best.id,
-    score: best.matchScore,
-    anilist,
-    candidates: ranked.slice(0, 8).map((x) => ({
-      title: x.title,
-      session: x.session,
-      year: x.year,
-      episodes: x.episodes,
-      score: x.matchScore,
-    })),
-  };
+    const result = {
+      anilistId,
+      session: best.session,
+      title: best.title,
+      animepaheId: best.id,
+      score: best.matchScore,
+      anilist,
+      candidates: ranked.slice(0, 8).map((x) => ({
+        title: x.title,
+        session: x.session,
+        year: x.year,
+        episodes: x.episodes,
+        score: x.matchScore,
+      })),
+    };
 
-  return mappingCache[anilistId];
+    setCache(key, result, CACHE_TTL.MAPPING);
+    return result;
+  });
 }
 
 async function loadAllEpisodes(session) {
-  if (episodeCache[session]) return episodeCache[session];
+  const key = `episodes:${session}`;
+  const cached = getCache(key);
+  if (cached) return cached;
 
-  let page = 1;
-  let allEpisodes = [];
+  return withInflight(key, async () => {
+    let page = 1;
+    let allEpisodes = [];
 
-  while (true) {
-    const res = await safeFetch(
-      `${BASE}/${session}/releases?sort=episode_desc&page=${page}`
-    );
+    while (true) {
+      const res = await safeFetch(
+        `${normalizeBaseUrl(BASE)}/${session}/releases?sort=episode_desc&page=${page}`
+      );
 
-    const data = res.data?.data || [];
+      const data = Array.isArray(res.data?.data) ? res.data.data : [];
 
-    if (!data.length) break;
+      if (!data.length) break;
 
-    allEpisodes = [...allEpisodes, ...data];
-    page++;
+      allEpisodes = [...allEpisodes, ...data];
+      page++;
 
-    if (page > 100) break;
-  }
+      if (page > 100) break;
+      await sleep(250);
+    }
 
-  episodeCache[session] = allEpisodes;
-  return allEpisodes;
+    setCache(key, allEpisodes, CACHE_TTL.EPISODES);
+    return allEpisodes;
+  });
 }
 
 function detectQuality(source = {}) {
   const text = `${source.quality || ""} ${source.resolution || ""} ${source.label || ""} ${source.url || ""}`;
-
   const match = text.match(/(360|480|720|1080|2160)p?/i);
-
   if (match) return `${match[1]}p`;
-
   return "auto";
 }
 
@@ -343,7 +437,6 @@ function buildStreams(sources = []) {
   let dub = normalized.filter((s) => s.audio === "dub");
   const unknown = normalized.filter((s) => s.audio === "unknown");
 
-  // If API does not clearly mark audio, keep unknown in both instead of guessing wrong.
   if (!sub.length && unknown.length) sub = unknown;
   if (!dub.length && unknown.length) dub = unknown;
 
@@ -390,8 +483,11 @@ function selectEpisode(episodes, requestedEp) {
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
-    message: "AnimePahe resolver running",
+    message: "Resolver API running",
+    base: normalizeBaseUrl(BASE),
     endpoints: {
+      health: "/health",
+      debugUpstream: "/debug/upstream",
       search: "/search?q=dr%20stone",
       resolve: "/resolve?anilistId=199221",
       watch: "/watch?anilistId=199221&ep=1&audio=sub",
@@ -401,21 +497,59 @@ app.get("/", (req, res) => {
   });
 });
 
+app.get("/health", (req, res) => {
+  res.json({
+    status: "ok",
+    uptime: process.uptime(),
+    cacheEntries: cacheStore.size,
+    inflightRequests: inflight.size,
+    base: normalizeBaseUrl(BASE),
+    timestamp: Date.now(),
+  });
+});
+
+app.get("/debug/upstream", async (req, res) => {
+  try {
+    const url = `${normalizeBaseUrl(BASE)}/search?q=naruto`;
+    const response = await http.get(url);
+
+    res.json({
+      status: "ok",
+      upstream: normalizeBaseUrl(BASE),
+      httpStatus: response.status,
+      contentType: response.headers?.["content-type"] || null,
+      isHtml: isHtmlResponse(response),
+      preview:
+        typeof response.data === "string"
+          ? response.data.slice(0, 500)
+          : response.data,
+    });
+  } catch (error) {
+    res.status(500).json({
+      status: "error",
+      error: "Upstream debug failed",
+      reason: error.message,
+    });
+  }
+});
+
 app.get("/search", async (req, res) => {
   try {
-    const q = req.query.q;
+    const q = String(req.query.q || "").trim();
     if (!q) return res.status(400).json({ error: "Query missing" });
 
     const results = await searchAnimePahe(q);
 
     res.json({
+      status: "ok",
       query: q,
       results,
     });
   } catch (err) {
     res.status(500).json({
+      status: "error",
       error: "Search failed",
-      reason: err.response?.data || err.message,
+      reason: err.message,
     });
   }
 });
@@ -429,26 +563,36 @@ app.get("/resolve", async (req, res) => {
     }
 
     const resolved = await resolveAnimePaheSession(anilistId);
-    res.json(resolved);
+    res.json({
+      status: "ok",
+      ...resolved,
+    });
   } catch (err) {
     res.status(500).json({
+      status: "error",
       error: "Resolve failed",
-      reason: err.response?.data || err.message,
+      reason: err.message,
     });
   }
 });
 
 app.get("/all-episodes", async (req, res) => {
   try {
-    const session = req.query.session;
+    const session = String(req.query.session || "").trim();
     if (!session) return res.status(400).json({ error: "Session missing" });
 
     const episodes = await loadAllEpisodes(session);
-    res.json(episodes);
+    res.json({
+      status: "ok",
+      session,
+      total: episodes.length,
+      results: episodes,
+    });
   } catch (err) {
     res.status(500).json({
+      status: "error",
       error: "All episodes failed",
-      reason: err.response?.data || err.message,
+      reason: err.message,
     });
   }
 });
@@ -463,19 +607,25 @@ app.get("/stream", async (req, res) => {
     }
 
     const stream = await safeFetch(
-      `${BASE}/play/${session}?episodeId=${ep}&downloads=false`
+      `${normalizeBaseUrl(BASE)}/play/${session}?episodeId=${ep}&downloads=false`
     );
 
-    const sources = stream.data?.sources || [];
+    const sources = Array.isArray(stream.data?.sources) ? stream.data.sources : [];
 
     if (!sources.length) {
-      return res.json({ error: "No sources found" });
+      return res.json({
+        status: "ok",
+        session,
+        episodeSession: ep,
+        error: "No sources found",
+      });
     }
 
     const built = buildStreams(sources);
     const preferred = pickPreferredStreams(built, audio);
 
     res.json({
+      status: "ok",
       session,
       episodeSession: ep,
       audio: preferred.audio,
@@ -485,8 +635,9 @@ app.get("/stream", async (req, res) => {
     });
   } catch (err) {
     res.status(500).json({
+      status: "error",
       error: "Stream failed",
-      reason: err.response?.data || err.message,
+      reason: err.message,
     });
   }
 });
@@ -507,6 +658,7 @@ app.get("/watch", async (req, res) => {
 
     if (!episodes.length) {
       return res.json({
+        status: "ok",
         error: "No episodes found",
         resolved,
       });
@@ -516,6 +668,7 @@ app.get("/watch", async (req, res) => {
 
     if (!selectedEp) {
       return res.json({
+        status: "ok",
         error: "Episode not found",
         requestedEpisode: ep,
         resolved,
@@ -528,13 +681,14 @@ app.get("/watch", async (req, res) => {
     }
 
     const stream = await safeFetch(
-      `${BASE}/play/${session}?episodeId=${selectedEp.session}&downloads=false`
+      `${normalizeBaseUrl(BASE)}/play/${session}?episodeId=${selectedEp.session}&downloads=false`
     );
 
-    const sources = stream.data?.sources || [];
+    const sources = Array.isArray(stream.data?.sources) ? stream.data.sources : [];
 
     if (!sources.length) {
       return res.json({
+        status: "ok",
         error: "No stream found",
         resolved,
         episode: selectedEp,
@@ -545,44 +699,41 @@ app.get("/watch", async (req, res) => {
     const preferred = pickPreferredStreams(built, audio);
 
     res.json({
+      status: "ok",
       title: resolved.title,
       anilistId,
       session,
       animepaheId: resolved.animepaheId,
       matchScore: resolved.score,
-
       requestedEpisode: ep || 1,
       actualEpisode: selectedEp.episode,
       episodeSession: selectedEp.session,
-
       audio: preferred.audio,
-
       sections: preferred.sections,
       selected: preferred,
-
       streams: built,
-
       debug: {
         totalSources: sources.length,
         subCount: built.sub.length,
         dubCount: built.dub.length,
-        allQualities: built.all.map((x) => ({
-          quality: x.quality,
-          audio: x.audio,
-          url: x.rawUrl,
-        })),
+        upstreamBase: normalizeBaseUrl(BASE),
       },
     });
   } catch (err) {
-    console.error("WATCH ERROR:", err.response?.data || err.message);
+    console.error("WATCH ERROR:", err.message);
 
     res.status(500).json({
+      status: "error",
       error: "Watch failed",
-      reason: err.response?.data || err.message,
+      reason: err.message,
     });
   }
 });
 
-app.listen(PORT, () => {
-  console.log(`🔥 AnimePahe API running on port ${PORT}`);
-});
+if (process.env.VERCEL) {
+  module.exports = app;
+} else {
+  app.listen(PORT, () => {
+    console.log(`🔥 Resolver API running on port ${PORT}`);
+  });
+}
